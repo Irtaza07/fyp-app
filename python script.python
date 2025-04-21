@@ -1,0 +1,140 @@
+import socket
+import csv
+import time
+import os
+import threading
+
+# TCP Server Configuration
+TCP_IP = "0.0.0.0"  # Listen on all interfaces
+TCP_PORT = 3333
+MAX_CONNECTIONS = 2  # One ESP for Left Hand, One for Right Hand
+
+# CSV File Setup
+csv_filename = "Saad.csv"
+file_exists = os.path.isfile(csv_filename)
+
+# Create CSV file with headers if it doesn't exist
+if not file_exists:
+    with open(csv_filename, mode="w", newline="") as csv_file:
+        csv_writer = csv.writer(csv_file)
+        headers = ["Gesture"]
+        for frame in range(1, 21):  # 20 frames
+            headers += [
+                f"LH_Flex_F{frame}_1", f"LH_Flex_F{frame}_2", f"LH_Flex_F{frame}_3", f"LH_Flex_F{frame}_4", f"LH_Flex_F{frame}_5",
+                f"LH_Gyro_F{frame}_X", f"LH_Gyro_F{frame}_Y", f"LH_Gyro_F{frame}_Z",
+                f"LH_Accel_F{frame}_X", f"LH_Accel_F{frame}_Y", f"LH_Accel_F{frame}_Z",
+                f"RH_Flex_F{frame}_1", f"RH_Flex_F{frame}_2", f"RH_Flex_F{frame}_3", f"RH_Flex_F{frame}_4", f"RH_Flex_F{frame}_5",
+                f"RH_Gyro_F{frame}_X", f"RH_Gyro_F{frame}_Y", f"RH_Gyro_F{frame}_Z",
+                f"RH_Accel_F{frame}_X", f"RH_Accel_F{frame}_Y", f"RH_Accel_F{frame}_Z"
+            ]
+        csv_writer.writerow(headers)
+
+print("\n📡 Waiting for ESP32 connections...\n")
+
+# Global variables for sensor data
+sensor_data = {"LH": "", "RH": ""}
+lock = threading.Lock()  # Lock for thread safety
+
+# Function to handle each client connection (ESP32)
+def handle_client(client_socket, hand):
+    global sensor_data
+    buffer = ""
+
+    try:
+        while True:
+            data = client_socket.recv(1024).decode("utf-8")
+            if not data:
+                break  
+
+            buffer += data
+            while "\n" in buffer:
+                message, buffer = buffer.split("\n", 1)
+                message = message.strip()
+
+                with lock:
+                    sensor_data[hand] = message
+
+    except Exception as e:
+        print(f"⚠ Error in {hand} thread: {e}")
+    finally:
+        client_socket.close()
+
+# Start TCP Server
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind((TCP_IP, TCP_PORT))
+server.listen(MAX_CONNECTIONS)
+
+# Accept connections from ESP32 devices in separate threads
+clients = {}
+for hand in ["LH", "RH"]:
+    client_socket, addr = server.accept()
+    clients[hand] = client_socket
+    print(f"🔌 Connection established with {addr} ({hand})")
+    threading.Thread(target=handle_client, args=(client_socket, hand), daemon=True).start()
+
+# Function to extract sensor values from received data
+def extract_values(data_str):
+    """Extract numerical values from received data safely"""
+    try:
+        parts = data_str.split(" | ")
+        values = {}
+        for part in parts:
+            if ":" in part:
+                key, val = part.split(":", 1)
+                values[key.strip()] = [float(x) if x else 0 for x in val.split(",")]
+        return values
+    except Exception as e:
+        print(f"⚠ Data extraction error: {e}")
+        return {}
+
+# Function to get user input without blocking
+def get_user_input():
+    global sensor_data
+    
+    while True:
+        user_input = input("> ").strip().lower()
+
+        if user_input == "r":
+            print("⏳ Waiting for data from both ESPs to start recording...")
+            frame_count = 0
+            row_data = ["Woh Larka"]
+
+            start_time = time.time()
+            while frame_count < 20 and time.time() - start_time < 5:
+                with lock:
+                    lh_data = sensor_data.get("LH", "")
+                    rh_data = sensor_data.get("RH", "")
+
+                if lh_data and rh_data:
+                    lh_values = extract_values(lh_data)
+                    rh_values = extract_values(rh_data)
+
+                    # Ensure both sides have valid data
+                    if len(lh_values.get("LH_Flex", [])) == 5 and len(rh_values.get("RH_Flex", [])) == 5:
+                        frame_count += 1
+
+                        row_data += lh_values.get("LH_Flex", [0]*5) + lh_values.get("LH_Gyro", [0]*3) + lh_values.get("LH_Accel", [0]*3)
+                        row_data += rh_values.get("RH_Flex", [0]*5) + rh_values.get("RH_Gyro", [0]*3) + rh_values.get("RH_Accel", [0]*3)
+
+                        print(f"✅ Frame {frame_count}/20 recorded")
+                        time.sleep(3 / 20)
+
+            if frame_count == 20:
+                with open(csv_filename, mode="a", newline="") as csv_file:
+                    csv_writer = csv.writer(csv_file)
+                    csv_writer.writerow(row_data)
+                print("✅ Recording completed! Data saved.")
+            else:
+                print("⚠ Recording failed. Not enough frames.")
+
+        elif user_input == "q":
+            print("🚪 Exiting Program...")
+            os._exit(0)
+
+# Start user input in a separate thread
+input_thread = threading.Thread(target=get_user_input, daemon=True)
+input_thread.start()
+
+# Keep the program running
+while True:
+    time.sleep(1)
